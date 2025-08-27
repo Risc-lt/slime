@@ -1,4 +1,7 @@
+import os
 import ray
+import torch
+from torch.profiler import profile, record_function, ProfilerActivity
 
 from slime.ray.placement_group import create_actor_group, create_placement_groups, create_rollout_manager
 from slime.utils.arguments import parse_args
@@ -23,7 +26,7 @@ def train(args):
         args.num_rollout = num_rollout_per_epoch * args.num_epoch
     assert args.num_rollout > 0
 
-    # sync the initialization (model initalization, load checkpoint, etc.)
+    # sync the initialization (model init, load checkpoint, etc.)
     start_rollout_ids = ray.get(
         actor_model.async_init(args, role="actor", with_ref=args.kl_coef != 0 or args.use_kl_loss)
     )
@@ -34,7 +37,7 @@ def train(args):
     if args.rollout_global_dataset:
         ray.get(rollout_manager.controller.load.remote(args.start_rollout_id - 1))
 
-    # initialize the connection for weight update during training
+    # init weight update
     ray.get(actor_model.async_init_weight_update_connections(rollout_manager))
 
     if args.offload:
@@ -46,14 +49,27 @@ def train(args):
     if args.offload:
         ray.get(rollout_manager.async_onload(tags=[GPU_MEMORY_TYPE_KV_CACHE]))
 
-    # train loop.
-    # note that for async training, one can change the position of the sync operation(ray.get).
+    # ---- Profiler init ----
+    profile_dir = "./log/profiler"
+    os.makedirs(profile_dir, exist_ok=True)
+    prof = profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(profile_dir),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=True,
+    )
+    prof.start()
+    # -----------------------
+
+    # train loop
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
-        # TODO extract the duplicated eval logic
         if args.eval_interval is not None and rollout_id == 0:
             ray.get(rollout_manager.async_eval(rollout_id))
 
-        rollout_data_ref = ray.get(rollout_manager.async_generate(rollout_id))
+        with record_function("ray_rollout"):
+            rollout_data_ref = ray.get(rollout_manager.async_generate(rollout_id))
 
         if args.offload:
             ray.get(rollout_manager.async_offload())
@@ -68,10 +84,6 @@ def train(args):
             if args.rollout_global_dataset:
                 ray.get(rollout_manager.controller.save.remote(rollout_id))
 
-        if args.offload:
-            ray.get(actor_model.async_offload())
-            ray.get(rollout_manager.async_onload(tags=[GPU_MEMORY_TYPE_WEIGHTS]))
-
         ray.get(actor_model.async_update_weights())
 
         if args.offload:
@@ -81,7 +93,13 @@ def train(args):
             (rollout_id + 1) % args.eval_interval == 0
             or (num_rollout_per_epoch is not None and (rollout_id + 1) % num_rollout_per_epoch == 0)
         ):
-            ray.get(rollout_manager.async_eval(rollout_id))
+            with record_function("ray_eval"):
+                ray.get(rollout_manager.async_eval(rollout_id))
+
+        prof.step()  # needed in every iteration to record the profiler step
+
+    prof.stop()
+    print("Profiler stopped, results saved at", profile_dir)
 
 
 if __name__ == "__main__":
